@@ -383,6 +383,8 @@ def save_dev_show_json_data(net_dev):
                 filehandle.write(write_str)
             write_str = spacer + "*" * 20 + "\tEnd of File\t" + "*" * 20
             filehandle.write(write_str)
+            write_time = get_current_time("t")
+            print(write_time, " - File written to: ", file_name)
 
 def write_dev_vars_to_wb(wb_obj, device, var_loc):
     """

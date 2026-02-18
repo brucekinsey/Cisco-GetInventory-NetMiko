@@ -1,3 +1,5 @@
+# e5AB5gQNtGy0dRfDleVbwCG95UUJHGYHNNW0HdjL
+
 #!/usr/bin/env python3
 
 # conda install ahuff::pynetbox
@@ -63,7 +65,7 @@ import openpyxl
 import pynetbox
 
 
-DEFAULT_SITE_NAME = "a site name"
+DEFAULT_SITE_NAME = "SCDS IT Dept."
 DEFAULT_MANUFACTURER_CISCO = "Cisco"
 DEFAULT_DEVICE_ROLE_NAME = "Access Switch"
 

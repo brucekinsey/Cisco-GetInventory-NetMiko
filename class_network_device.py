@@ -100,6 +100,14 @@ class NetworkDevice():
             # default ssh port
             self.connection["port"] = 22
             self.port = 22
+            self.connection.update({
+                "fast_cli": True,
+                "global_delay_factor": 1,
+                # optionally also tune timeouts if you have slow banners/auth:
+                "conn_timeout": 10,
+                "banner_timeout": 15,
+                "auth_timeout": 15,
+            })
 
         self.connection["global_delay_factor"] = 2
 
