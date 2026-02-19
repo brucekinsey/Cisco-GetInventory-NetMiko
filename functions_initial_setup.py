@@ -1,6 +1,7 @@
 import re
 import os
-import json
+#import json
+import orjson
 import sys
 from pathlib import Path
 from class_network_device import NetworkDevice
@@ -13,6 +14,8 @@ from functions_helpers import (
     verify_path,
     next_available_row,
     get_current_time,
+    load_device_type_cache,
+    save_device_type_cache,
 )
 
 #moved
@@ -98,6 +101,8 @@ def read_network_devices(wb_obj, dflt_creds):
 
     return_list = []
     seen = {}  # norm_host -> first_row
+    
+    cache = load_device_type_cache()
 
     for i in range(8, sheet_obj.max_row + 1):
         host = rw_cell(sheet_obj, i, 1)
@@ -132,6 +137,13 @@ def read_network_devices(wb_obj, dflt_creds):
         parse_method = rw_cell(sheet_obj, i, 3)
         if not parse_method:
             parse_method = "autodetect"
+
+        # If autodetect, try cache (key by normalized host string)
+        if str(parse_method).lower() == "autodetect":
+            #cached = type_cache.get(norm_host)  # norm_host already computed
+            cached = cache.get(norm_host)
+            if cached:
+                parse_method = cached
 
         protocol = rw_cell(sheet_obj, i, 4)
         port_override = rw_cell(sheet_obj, i, 5)
@@ -182,6 +194,7 @@ def get_json_data_from_file(file_name):
     """
     Reads a json file and imports all the values.
     """
-    with open(file_name) as file:
-        return_value = json.load(file)
+    with open(file_name, "rb") as file:
+        #return_value = json.load(file)
+        return_value = orjson.loads(file.read())
     return return_value

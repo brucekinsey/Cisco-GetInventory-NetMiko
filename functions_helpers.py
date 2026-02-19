@@ -1,11 +1,30 @@
 import os
-import openpyxl
 import sys
 import re
+#import json
+import orjson
 from datetime import datetime
-
-
 from pathlib import Path
+
+import openpyxl
+
+def load_device_type_cache(cache_path="device_type_cache.json"):
+    try:
+        #with open(cache_path, "r") as f:
+            #return json.load(f)
+        with open(cache_path, "rb") as f:
+            return orjson.loads(f.read())
+    except Exception:
+        return {}
+
+def save_device_type_cache(cache, cache_path="device_type_cache.json"):
+    try:
+        #with open(cache_path, "w") as f:
+            #json.dump(cache, f, indent=2, sort_keys=True)
+        with open(cache_path, "wb") as f:
+            f.write(orjson.dumps(cache, option=orjson.OPT_INDENT_2))
+    except Exception:
+        pass
 
 def find_val_in_col(value, column):
     """
@@ -183,7 +202,7 @@ def save_xls_old(wb_obj, file_name=None, output_dir=None, input_file_name=None):
             raise ValueError("save_xls: input_file_name is required when file_name is not provided")
         file_save_string += input_file_name[:-5] + "_new.xlsx"
 
-    print("saving the file to: " + file_save_string)
+    print("Saving the file to: " + file_save_string)
     wb_obj.save(file_save_string)
 
 def save_xls(wb_obj, input_file_name, file_name=None, output_dir=None):
@@ -200,8 +219,13 @@ def save_xls(wb_obj, input_file_name, file_name=None, output_dir=None):
     else:
         file_save_string += input_file_name[:-5] + "_new.xlsx"
 
-    print("saving the file to: " + file_save_string)
+    current_time = get_current_time("t")
+    print(current_time, " - Saving the file to: " + file_save_string)
+    
     wb_obj.save(file_save_string)
+    
+    current_time = get_current_time("t")
+    print(current_time, " - Saving the file to: " + file_save_string)
 
 def mod_dir_based_on_os(dir_name):
     """

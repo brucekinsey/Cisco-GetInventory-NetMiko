@@ -3,6 +3,9 @@
 import re
 import os
 
+from time import perf_counter
+from collections import defaultdict
+
 from functions_helpers import left, mod_dir_based_on_os, print_net_dev_msg
 
 # NOTE: These gather functions rely on a bunch of helpers that currently live in main.py.
@@ -289,8 +292,8 @@ def gather_commands(connection, net_dev, other_shows, count=0):
     Logs the other show commands requested by the user, in "Commands" sheet
     """
     for command in other_shows:
-        if VERBOSE:
-            print_net_dev_msg(net_dev, "Capturing '{}' as raw text".format(command))
+        #if VERBOSE:
+            #print_net_dev_msg(net_dev, "Capturing '{}' as raw text".format(command))
         output = connection.send_command(command)
         net_dev.user_rqstd_show[command] = output
 
@@ -303,7 +306,7 @@ def gather_commands(connection, net_dev, other_shows, count=0):
 # So: move them here too (recommended). Use placeholders unless you want me to refactor.
 
 #moved
-def log_cmd_textfsm(connection, net_dev, command, count, txtfsm_tmpl=None):
+def log_cmd_textfsm_orig(connection, net_dev, command, count, txtfsm_tmpl=None):
     """
     Logs the Command with the textfsm option enabled, it also uses
     a template if needed. Also adds the output to the NetworkDevice
@@ -318,6 +321,39 @@ def log_cmd_textfsm(connection, net_dev, command, count, txtfsm_tmpl=None):
         net_dev.show_output_json[command] = output.copy()
     else:
         net_dev.show_output_json[command] = output
+    return output
+
+def log_cmd_textfsm(connection, net_dev, command, count, txtfsm_tmpl=None):
+    """
+    Logs command output with TextFSM enabled and records elapsed time.
+    Stores timings on net_dev.cmd_timings[command] as a list of elapsed seconds.
+    """
+    #if VERBOSE:
+        #print_net_dev_msg(net_dev, f"Capturing '{command}' with TextFSM Enabled")
+
+    if txtfsm_tmpl:
+        txtfsm_tmpl = mod_dir_based_on_os(txtfsm_tmpl)
+
+    # Lazy init so you don't have to edit the class yet
+    if not hasattr(net_dev, "cmd_timings") or net_dev.cmd_timings is None:
+        net_dev.cmd_timings = defaultdict(list)
+
+    t0 = perf_counter()
+    output = connection.send_command(
+        command,
+        use_textfsm=True,
+        textfsm_template=txtfsm_tmpl,
+        # optionally: read_timeout=XX (later, once you identify slow cmds)
+    )
+    dt = perf_counter() - t0
+    net_dev.cmd_timings[command].append(dt)
+
+    # existing behavior
+    if isinstance(output, list):
+        net_dev.show_output_json[command] = output.copy()
+    else:
+        net_dev.show_output_json[command] = output
+
     return output
 
 #moved
@@ -361,8 +397,8 @@ def get_vrf_names(net_dev, connection, count):
             txt_tmpl = mod_dir_based_on_os(txt_tmpl)
         output = log_cmd_textfsm(connection, net_dev, command, count, txt_tmpl)
 
-        if VERBOSE:
-            print_net_dev_msg(net_dev, "Parsing vrfs")
+        #if VERBOSE:
+            #print_net_dev_msg(net_dev, "Parsing vrfs")
         if isinstance(output, list):
             for vrf in output:
                 if vrf['name'] not in vrf_names:

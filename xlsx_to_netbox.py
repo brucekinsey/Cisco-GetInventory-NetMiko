@@ -60,6 +60,7 @@ import json
 import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
+from pynetbox.core.query import RequestError
 
 import openpyxl
 import pynetbox
@@ -81,6 +82,33 @@ IP_CACHE_BY_ADDRESS: Dict[str, Any] = {}              # "1.2.3.4/24" -> ip obj
 IP_CACHE_BY_HOST: Dict[str, Any] = {}                 # "1.2.3.4" -> ip obj
 
 
+
+# -----------------------------
+# Inventory sheet -> Interface type override
+# -----------------------------
+def _norm_type_key(v: Any) -> str:
+    """Normalize free-text optics/media strings for reliable matching."""
+    if v is None:
+        return ""
+    s = str(v).strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+# Map Inventory!Description -> NetBox interface 'type' slug
+# (Keys are normalized with _norm_type_key)
+INVENTORY_DESC_TO_NBTYPE: Dict[str, str] = {
+    _norm_type_key("SFP-10GBase-SR"): "10gbase-x-sfpp",      # display: SFP+ (10GE)
+    _norm_type_key("SFP-10Gbase-SR"): "10gbase-x-sfpp",
+    _norm_type_key("SFP-10Gbase-LR"): "10gbase-x-sfpp",
+    _norm_type_key("4500X-16 10GE (SFP+)"): "10gbase-x-sfpp",
+    _norm_type_key("10GE SFP+"): "10gbase-x-sfpp",
+
+    _norm_type_key("1000BaseSX SFP"): "1000base-sx",
+    _norm_type_key("1000BaseSX"): "1000base-sx",
+    _norm_type_key("1000BaseLH"): "1000base-lx10",          # display: 1000BASE-LX10/LH
+    _norm_type_key("1000BaseLX SFP"): "1000base-lx",
+    _norm_type_key("SFP-10GBase-LR"): "10gbase-lr",         # display: 10GBASE-LR
+}
 # -----------------------------
 # Helpers
 # -----------------------------
@@ -135,20 +163,52 @@ def expand_vlan_list(s: str) -> List[int]:
     return sorted(set(vlans))
 
 
-def map_interface_type(human: Any) -> str:
+def map_interface_type(human: Any, inventory_desc: Any = None) -> str:
+    """Return NetBox interface type slug.
+
+    Precedence:
+      1) Inventory sheet (authoritative optics/media description per-port)
+      2) Interfaces sheet "Type" column exact mapping (common values)
+      3) Heuristics (fallback)
+    """
+    # 1) Inventory override (most accurate for physical media)
+    inv_key = _norm_type_key(inventory_desc)
+    if inv_key and inv_key in INVENTORY_DESC_TO_NBTYPE:
+        return INVENTORY_DESC_TO_NBTYPE[inv_key]
+
+    # 2) Interfaces sheet explicit mapping
+    human_key = _norm_type_key(human)
+    INTERFACES_TYPE_TO_NBTYPE: Dict[str, str] = {
+        _norm_type_key("Gigabit Ethernet"): "1000base-t",
+        _norm_type_key("Ten Gigabit Ethernet"): "10gbase-t",
+        _norm_type_key("Ten Gigabit Ethernet Port"): "10gbase-t",
+        _norm_type_key("PowerPC FastEthernet"): "100base-tx",
+        _norm_type_key("RP management port"): "100base-tx",
+        _norm_type_key("EtherChannel"): "lag",
+        # SVIs are virtual interfaces in NetBox
+        _norm_type_key("EtherSVI"): "virtual",
+        _norm_type_key("Ethernet SVI"): "virtual",
+    }
+    if human_key and human_key in INTERFACES_TYPE_TO_NBTYPE:
+        return INTERFACES_TYPE_TO_NBTYPE[human_key]
+
+    # 3) Heuristics
     s = "" if human is None else str(human).strip()
     u = s.upper()
-    if "10G" in u or "SFP+" in u or "SFPP" in u:
+
+    if "SFP+" in u or "SFPP" in u or "10GBASE" in u or "10GB" in u:
         return "10gbase-x-sfpp"
+    if "10G" in u:
+        return "10gbase-t"
     if "1000" in u and ("SFP" in u or "BASESX" in u or "BASELX" in u or "BASE-X" in u):
         return "1000base-x-sfp"
-    if "1000BASE" in u or "1GE" in u or "1000" in u:
+    if "1000BASE" in u or "1GE" in u or re.search(r"\b1g\b", u):
         return "1000base-t"
-    if "100BASE" in u:
+    if "100BASE" in u or "FAST" in u:
         return "100base-tx"
-    if "SVI" in u or "VLAN" in u or "ETHERSVI" in u:
-        # NetBox doesn't have a perfect SVI type; "virtual" is a reasonable fit.
+    if "SVI" in u or "VLAN" in u:
         return "virtual"
+
     return "other"
 
 
@@ -256,6 +316,77 @@ def pick_best_ip(ip_objs, desired_iface=None):
 
     return ip_objs[0]
 
+# Neighbor helpers go here:
+def _norm(s: Any) -> str:
+    return "" if s is None else str(s).strip()
+
+def _key(host: Any, port: Any) -> Tuple[str, str]:
+    return (_norm(host), _norm(port))
+
+
+def build_neighbors_from_cdp(ws_cdp) -> Dict[Tuple[str, str], str]:
+    """
+    Return dict[(hostname, local_port)] = remote_host
+
+    Match rule:
+      - CDP.Hostname + CDP.Local Port  <->  Interfaces.Hostname + Interfaces.Interface
+
+    Inclusion rule (per your spec):
+      - requires Hostname, Local Port, Remote Host
+    """
+    hdr = sheet_headers(ws_cdp)
+    required = ["Hostname", "Local Port", "Remote Host"]
+    for k in required:
+        if k not in hdr:
+            raise RuntimeError(f"Sheet '{ws_cdp.title}' missing required header '{k}'")
+
+    out: Dict[Tuple[str, str], str] = {}
+    for r in range(2, ws_cdp.max_row + 1):
+        host = ws_cdp.cell(row=r, column=hdr["Hostname"]).value
+        local = ws_cdp.cell(row=r, column=hdr["Local Port"]).value
+        remote = ws_cdp.cell(row=r, column=hdr["Remote Host"]).value
+
+        if not _norm(host) or not _norm(local) or not _norm(remote):
+            continue
+
+        out[_key(host, local)] = _norm(remote)
+
+    return out
+
+def build_neighbors_from_lldp(ws_lldp) -> Dict[Tuple[str, str], str]:
+    """
+    Return dict[(hostname, local_port)] = description_string
+
+    Match rule:
+      - LLDP.Hostname + LLDP.Local Port  <->  Interfaces.Hostname + Interfaces.Short IF
+
+    Inclusion rule (per your spec):
+      - ONLY set description from LLDP where:
+          Local Port, Remote Host, Remote Description, and Software have values
+    """
+    hdr = sheet_headers(ws_lldp)
+    required = ["Hostname", "Local Port", "Remote Host", "Remote Description", "Software"]
+    for k in required:
+        if k not in hdr:
+            raise RuntimeError(f"Sheet '{ws_lldp.title}' missing required header '{k}'")
+
+    out: Dict[Tuple[str, str], str] = {}
+    for r in range(2, ws_lldp.max_row + 1):
+        host = ws_lldp.cell(row=r, column=hdr["Hostname"]).value
+        local = ws_lldp.cell(row=r, column=hdr["Local Port"]).value
+        remote = ws_lldp.cell(row=r, column=hdr["Remote Host"]).value
+        rdesc = ws_lldp.cell(row=r, column=hdr["Remote Description"]).value
+        software = ws_lldp.cell(row=r, column=hdr["Software"]).value
+
+        # strict inclusion rule
+        if not (_norm(host) and _norm(local) and _norm(remote) and _norm(rdesc) and _norm(software)):
+            continue
+
+        # what you want in Interfaces.description
+        out[_key(host, local)] = f"{_norm(remote)} ({_norm(rdesc)})"
+
+    return out
+
 # -----------------------------
 # NetBox helpers (cached)
 # -----------------------------
@@ -324,7 +455,7 @@ def nb_get_or_create_vlan(nb, site_id: int, vid: int, commit: bool) -> Any:
     if vlan:
         VLAN_CACHE[key] = vlan
         return vlan
-    payload = {"site": site_id, "vid": vid, "name": f"VLAN{vid}", "status": "active"}
+    payload = {"site": None, "vid": vid, "name": f"VLAN{vid}", "status": "active"}
     if not commit:
         obj = type("Obj", (), {"id": -1, "vid": vid})
         VLAN_CACHE[key] = obj
@@ -529,6 +660,8 @@ def load_main_devices(ws_main) -> List[Dict[str, Any]]:
         if host_ip is None or str(host_ip).strip() == "":
             continue
         status_raw = ws_main.cell(row=r, column=2).value  # B
+        if status_raw is None or str(status_raw).strip() == "":
+            continue
         platform = ws_main.cell(row=r, column=3).value  # C
         name = ws_main.cell(row=r, column=10).value     # J
         model = ws_main.cell(row=r, column=11).value    # K
@@ -554,11 +687,13 @@ def load_interfaces(ws_intf) -> Dict[str, List[Dict[str, Any]]]:
         if hostname is None or str(hostname).strip() == "":
             continue
         if_name = ws_intf.cell(row=r, column=2).value
+        short_if = ws_intf.cell(row=r, column=3).value
         if if_name is None or str(if_name).strip() == "":
             continue
         rec = {
             "hostname": str(hostname).strip(),
             "name": str(if_name).strip(),
+            "short_if": "" if short_if is None else str(short_if).strip(),  # <-- NEW
             "description": "" if ws_intf.cell(row=r, column=4).value is None else str(ws_intf.cell(row=r, column=4).value).strip(),
             "type_human": ws_intf.cell(row=r, column=5).value,
             "link": ws_intf.cell(row=r, column=7).value,
@@ -570,6 +705,37 @@ def load_interfaces(ws_intf) -> Dict[str, List[Dict[str, Any]]]:
         }
         by_host.setdefault(rec["hostname"], []).append(rec)
     return by_host
+
+
+def load_inventory_type_overrides(ws_inv) -> Dict[Tuple[str, str], str]:
+    """Return {(hostname, interface_name): description} from the Inventory sheet."""
+    hdr = sheet_headers(ws_inv)
+
+    def _col(*names: str) -> Optional[int]:
+        for n in names:
+            if n in hdr:
+                return hdr[n]
+        return None
+
+    c_host = _col("Hostname", "Host", "Device Hostname")
+    c_dev = _col("Device", "Interface", "Port")
+    c_desc = _col("Description", "Type", "Media")
+
+    if not (c_host and c_dev and c_desc):
+        raise RuntimeError(
+            f"Inventory sheet '{ws_inv.title}' must have headers for Hostname/Device/Description (found: {list(hdr)})"
+        )
+
+    out: Dict[Tuple[str, str], str] = {}
+    for r in range(2, ws_inv.max_row + 1):
+        host = ws_inv.cell(row=r, column=c_host).value
+        dev = ws_inv.cell(row=r, column=c_dev).value
+        desc = ws_inv.cell(row=r, column=c_desc).value
+        if not host or not dev or not desc:
+            continue
+        out[(str(host).strip(), str(dev).strip())] = str(desc).strip()
+    return out
+
 
 
 def load_neighbors(ws, force_platform_blank: bool) -> Dict[str, List[Dict[str, str]]]:
@@ -630,6 +796,7 @@ def upsert_device(nb, site, device_row: Dict[str, Any], commit: bool) -> Any:
     if existing:
         if not commit:
             # Show role behavior
+            cur_site = getattr(getattr(existing, "site", None), "name", None)
             if not getattr(existing, "role", None):
                 print(f"[DRY] Would update device '{name}' (role unset; set -> {DEFAULT_DEVICE_ROLE_NAME})")
             else:
@@ -640,9 +807,9 @@ def upsert_device(nb, site, device_row: Dict[str, Any], commit: bool) -> Any:
         if existing.device_type and getattr(existing.device_type, "id", None) != device_type.id:
             existing.device_type = device_type.id
             changed = True
-        if getattr(existing, "site", None) and getattr(existing.site, "id", None) != site.id:
-            existing.site = site.id
-            changed = True
+        #if getattr(existing, "site", None) and getattr(existing.site, "id", None) != site.id:
+            #existing.site = site.id
+            #changed = True
         if getattr(existing, "status", None) != status:
             existing.status = status
             changed = True
@@ -667,7 +834,7 @@ def prefetch_interfaces_for_device(nb, device_id: int) -> Dict[str, Any]:
     return {i.name: i for i in nb.dcim.interfaces.filter(device_id=device_id)}
 
 
-def bulk_create_missing_interfaces(nb, device, intfs: List[Dict[str, Any]], existing_by_name: Dict[str, Any], commit: bool) -> Dict[str, Any]:
+def bulk_create_missing_interfaces(nb, device, intfs: List[Dict[str, Any]], existing_by_name: Dict[str, Any], inv_type_by_host_intf: Dict[Tuple[str, str], str], commit: bool) -> Dict[str, Any]:
     to_create: List[Dict[str, Any]] = []
     for row in intfs:
         name = row["name"]
@@ -675,7 +842,8 @@ def bulk_create_missing_interfaces(nb, device, intfs: List[Dict[str, Any]], exis
             continue
 
         enabled = link_to_enabled(row.get("link"))
-        nb_type = map_interface_type(row.get("type_human"))
+        inv_desc = inv_type_by_host_intf.get((row.get("hostname",""), name))
+        nb_type = map_interface_type(row.get("type_human"), inventory_desc=inv_desc)
         mode = map_mode(row.get("mode_raw"))
 
         mtu = None
@@ -872,107 +1040,138 @@ def main() -> None:
         if required not in wb.sheetnames:
             raise RuntimeError(f"Workbook missing sheet '{required}'")
 
+    ws_inv = wb["Inventory"] if "Inventory" in wb.sheetnames else None
+
     ws_main = wb["Main"]
     ws_intf = wb["Interfaces"]
     ws_cdp = wb["CDP"]
     ws_lldp = wb["LLDP"]
+    
+    # Neighbor maps for interface descriptions
+    cdp_port_remote = build_neighbors_from_cdp(ws_cdp)
+    lldp_port_desc = build_neighbors_from_lldp(ws_lldp)
 
     site = nb_get_or_create_site(nb, args.site)
 
     devices = load_main_devices(ws_main)
     interfaces_by_host = load_interfaces(ws_intf)
+    inv_type_by_host_intf = load_inventory_type_overrides(ws_inv) if ws_inv is not None else {}
     cdp_by_host = load_neighbors(ws_cdp, force_platform_blank=False)
     lldp_by_host = load_neighbors(ws_lldp, force_platform_blank=True)
 
     print(f"Found {len(devices)} device rows in Main (non-blank Main!A from row 8).")
 
     for d in devices:
-        intfs = interfaces_by_host.get(d["name"], [])
+        try:
+            intfs = interfaces_by_host.get(d["name"], [])
 
-        # Resolve mgmt IP to masked interface IP if possible; else fallback host/24.
-        mgmt_ip, matched = resolve_mgmt_ip_with_mask(d["host_ip"], intfs)
-        d["mgmt_ip"] = mgmt_ip
+            # Resolve mgmt IP to masked interface IP if possible; else fallback host/24.
+            mgmt_ip, matched = resolve_mgmt_ip_with_mask(d["host_ip"], intfs)
+            d["mgmt_ip"] = mgmt_ip
 
-        # If no interface had the mgmt host IP, ensure we still assign the fallback IP
-        # to some interface so primary_ip4 can be set.
-        if not matched:
-            target = prefer_mgmt_interface(intfs)
-            if target is not None and (not target.get("ip_address")):
-                target["ip_address"] = mgmt_ip
+            # If no interface had the mgmt host IP, ensure we still assign the fallback IP
+            # to some interface so primary_ip4 can be set.
+            if not matched:
+                target = prefer_mgmt_interface(intfs)
+                if target is not None and (not target.get("ip_address")):
+                    target["ip_address"] = mgmt_ip
 
-        # Upsert device (primary_ip4 done later)
-        dev = upsert_device(nb, site, d, commit)
+            # Upsert device (primary_ip4 done later)
+            dev = upsert_device(nb, site, d, commit)
 
-        print(f"- {d['name']} ({d['mgmt_ip']}): {len(intfs)} interface rows")
+            print(f"- {d['name']} ({d['mgmt_ip']}): {len(intfs)} interface rows")
 
-        # If device is a dry-run stub, skip NetBox lookups requiring ids
-        if not commit and getattr(dev, "id", None) in (-1, None):
-            continue
-
-        # Prefetch existing interfaces once per device
-        existing_intfs_by_name = prefetch_interfaces_for_device(nb, dev.id)
-
-        # Bulk-create missing interfaces
-        existing_intfs_by_name = bulk_create_missing_interfaces(nb, dev, intfs, existing_intfs_by_name, commit)
-
-        # Bulk ensure all IPs for this device exist (interface IPs + mgmt)
-        ip_list: List[str] = []
-        ip_list = list(dict.fromkeys(ip_list))  # preserves order, removes duplicates
-        ensure_ips_exist_bulk(nb, ip_list, commit)
-        if d.get("mgmt_ip"):
-            ip_list.append(d["mgmt_ip"])
-        for row in intfs:
-            if row.get("ip_address"):
-                ip_list.append(str(row["ip_address"]).strip())
-        ensure_ips_exist_bulk(nb, ip_list, commit)
-
-        # Update interface fields, VLANs, and IP assignments (only when changed)
-        for row in intfs:
-            name = row["name"]
-            nb_intf = existing_intfs_by_name.get(name)
-            if not nb_intf:
-                # Shouldn't happen after bulk create + prefetch, but safe
+            # If device is a dry-run stub, skip NetBox lookups requiring ids
+            if not commit and getattr(dev, "id", None) in (-1, None):
                 continue
 
-            enabled = link_to_enabled(row.get("link"))
-            nb_type = map_interface_type(row.get("type_human"))
-            mode = map_mode(row.get("mode_raw"))
+            # Prefetch existing interfaces once per device
+            existing_intfs_by_name = prefetch_interfaces_for_device(nb, dev.id)
 
-            mtu = None
-            mtu_val = row.get("mtu")
-            if mtu_val is not None and str(mtu_val).strip() != "":
-                try:
-                    mtu = int(mtu_val)
-                except ValueError:
-                    mtu = None
+            # Bulk-create missing interfaces
+            existing_intfs_by_name = bulk_create_missing_interfaces(nb, dev, intfs, existing_intfs_by_name, inv_type_by_host_intf, commit)
 
-            desired_fields: Dict[str, Any] = {
-                "type": nb_type,
-                "enabled": enabled,
-                "description": row.get("description") or "",
-            }
-            if mtu is not None:
-                desired_fields["mtu"] = mtu
-            if mode is not None:
-                desired_fields["mode"] = mode
+            # Bulk ensure all IPs for this device exist (interface IPs + mgmt)
+            ip_list: List[str] = []
+            if d.get("mgmt_ip"):
+                ip_list.append(d["mgmt_ip"])
+            for row in intfs:
+                if row.get("ip_address"):
+                    ip_list.append(str(row["ip_address"]).strip())
+            ip_list = list(dict.fromkeys(ip_list))  # preserves order, removes duplicates
+            ensure_ips_exist_bulk(nb, ip_list, commit)
 
-            upsert_interface_fields(nb_intf, desired_fields, commit)
-            set_interface_vlans(nb, site, nb_intf, mode, row.get("access_vlan_raw"), row.get("tagged_vlans_raw"), commit)
+            # Update interface fields, VLANs, and IP assignments (only when changed)
+            for row in intfs:
+                name = row["name"]
+                nb_intf = existing_intfs_by_name.get(name)
+                if not nb_intf:
+                    # Shouldn't happen after bulk create + prefetch, but safe
+                    continue
 
-            ip_val = row.get("ip_address")
-            if ip_val:
-                assign_ip_to_interface(nb, nb_intf, str(ip_val).strip(), commit)
+                # --- NEW: neighbor description overlay (LLDP first, then CDP) ---
+                host = row.get("hostname", "")
+                short_if = row.get("short_if", "")
+                full_if = row.get("name", "")
 
-        # Set primary_ip4 after assignments
-        set_device_primary_ip4(nb, dev, d["mgmt_ip"], commit)
+                nbr_desc = None
+                if host and short_if:
+                    nbr_desc = lldp_port_desc.get(_key(host, short_if))
+                if not nbr_desc and host and full_if:
+                    nbr_desc = cdp_port_remote.get(_key(host, full_if))
 
-        # CDP/LLDP JSON custom field
-        neighbors_json = build_neighbors_json(d["name"], d["mgmt_ip"], cdp_by_host, lldp_by_host)
-        if not commit:
-            print(f"[DRY] Would set custom_fields['cdp_neighbors_json'] on device {d['name']} (len={len(neighbors_json)} chars)")
-        else:
-            set_device_custom_field(nb, d["name"], "cdp_neighbors_json", neighbors_json, commit)
+                # Only overwrite if Interfaces.Description is blank (recommended)
+                if nbr_desc and not (row.get("description") or ""):
+                    row["description"] = nbr_desc
+                # ---------------------------------------------------------------
 
+                enabled = link_to_enabled(row.get("link"))
+                inv_desc = inv_type_by_host_intf.get((row.get("hostname",""), name))
+                nb_type = map_interface_type(row.get("type_human"), inventory_desc=inv_desc)
+                mode = map_mode(row.get("mode_raw"))
+
+                mtu = None
+                mtu_val = row.get("mtu")
+                if mtu_val is not None and str(mtu_val).strip() != "":
+                    try:
+                        mtu = int(mtu_val)
+                    except ValueError:
+                        mtu = None
+
+                desired_fields: Dict[str, Any] = {
+                    "type": nb_type,
+                    "enabled": enabled,
+                    "description": row.get("description") or "",
+                }
+                if mtu is not None:
+                    desired_fields["mtu"] = mtu
+                if mode is not None:
+                    desired_fields["mode"] = mode
+
+                upsert_interface_fields(nb_intf, desired_fields, commit)
+                set_interface_vlans(nb, site, nb_intf, mode, row.get("access_vlan_raw"), row.get("tagged_vlans_raw"), commit)
+
+                ip_val = row.get("ip_address")
+                if ip_val:
+                    assign_ip_to_interface(nb, nb_intf, str(ip_val).strip(), commit)
+
+            # Set primary_ip4 after assignments
+            set_device_primary_ip4(nb, dev, d["mgmt_ip"], commit)
+
+            # CDP/LLDP JSON custom field
+            neighbors_json = build_neighbors_json(d["name"], d["mgmt_ip"], cdp_by_host, lldp_by_host)
+            if not commit:
+                print(f"[DRY] Would set custom_fields['cdp_neighbors_json'] on device {d['name']} (len={len(neighbors_json)} chars)")
+            else:
+                set_device_custom_field(nb, d["name"], "cdp_neighbors_json", neighbors_json, commit)
+        except RequestError as e:
+            # PyNetBox includes the response body with details like {'tagged_vlans': [...]}
+            print(f"[SKIP] NetBox RequestError for device '{d.get('name', '<unknown>')}'. Skipping. Error: {e}")
+            continue
+        except Exception as e:
+            # Optional: keep the run going even for unexpected errors
+            print(f"[SKIP] Unexpected error for device '{d.get('name', '<unknown>')}'. Skipping. Error: {e}")
+            continue
     print("Done.")
 
 
