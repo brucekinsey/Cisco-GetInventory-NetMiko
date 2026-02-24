@@ -274,9 +274,9 @@ def post_process_lldp_sheet_with_wtp_versions(wb_obj, headers_key, all_devices):
     COL_MGMT_IP     = col_for("Management IP", "Mgmt IP", "IP", "ip")
     COL_PORT_ID     = col_for("Port ID", "Remote Port", "Port id")
     COL_CHASSIS_ID  = col_for("Chassis ID", "Chassis id")
-    COL_SYSDESC     = col_for("Remote Description", "Sys Description", "Remote Desc", "remote_desc_data")
+    COL_SOFTWARE     = col_for("Software")
 
-    if not COL_SYSDESC:
+    if not COL_SOFTWARE:
         raise RuntimeError("LLDP post-process: could not find Remote Description column in LLDP headers")
 
     # ---- build an index of LLDP rows by local hostname (col A) ----
@@ -352,8 +352,8 @@ def post_process_lldp_sheet_with_wtp_versions(wb_obj, headers_key, all_devices):
 
                 if host_match or ip_match or port_match:
                     tag = f"WTP_SW={wtp_sw}"
-                    cur = ws.cell(r, COL_SYSDESC).value
-                    ws.cell(r, COL_SYSDESC).value = append_once(str(cur or ""), tag)
+                    cur = ws.cell(r, COL_SOFTWARE).value
+                    ws.cell(r, COL_SOFTWARE).value = append_once(str(cur or ""), tag)
                     break
 
 def add_err_msgs_to_wb(net_dev, wb_obj):
