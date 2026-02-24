@@ -274,10 +274,10 @@ def post_process_lldp_sheet_with_wtp_versions(wb_obj, headers_key, all_devices):
     COL_MGMT_IP     = col_for("Management IP", "Mgmt IP", "IP", "ip")
     COL_PORT_ID     = col_for("Port ID", "Remote Port", "Port id")
     COL_CHASSIS_ID  = col_for("Chassis ID", "Chassis id")
-    COL_SYSDESC     = col_for("System Description", "Sys Description", "System Desc", "system_desc_data")
+    COL_SYSDESC     = col_for("Remote Description", "Sys Description", "Remote Desc", "remote_desc_data")
 
     if not COL_SYSDESC:
-        raise RuntimeError("LLDP post-process: could not find System Description column in LLDP headers")
+        raise RuntimeError("LLDP post-process: could not find Remote Description column in LLDP headers")
 
     # ---- build an index of LLDP rows by local hostname (col A) ----
     # We only need quick filtering by local device (the switch).

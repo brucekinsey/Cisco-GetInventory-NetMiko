@@ -77,7 +77,7 @@ import functions_device_runner as fdr
 from functions_device_autodetect import (autodetect_devices, finalize_after_autodetect)
 import functions_device_autodetect as fda
 
-from functions_writers import (save_device_data, save_dev_show_json_data, write_dev_vars_to_wb, save_other_shows_to_txt, init_next_row_cache, gather_results_to_wb, add_err_msgs_to_wb)
+from functions_writers import (save_device_data, save_dev_show_json_data, write_dev_vars_to_wb, save_other_shows_to_txt, init_next_row_cache, gather_results_to_wb, add_err_msgs_to_wb, post_process_lldp_sheet_with_wtp_versions)
 import functions_writers as fw
 
 INPUT_FILE_NAME = "GetInventory - Default.xlsx"
@@ -99,14 +99,17 @@ TESTING = False
 """###Global Variables###"""
 GLBL_KEY_MAP = {}
 
-def setup_logging(verbose: bool) -> logging.Logger:
+def setup_logging(verbose: bool, tracebacks=True) -> logging.Logger:
     # 1) Make root logger not emit anything to console
     root = logging.getLogger()
     root.handlers.clear()
     root.setLevel(logging.WARNING)  # ignore debug/info from other libs
 
     # 2) Create handler for *only* your logger
-    handler = RichHandler(console=console, rich_tracebacks=True)
+    if tracebacks == True:
+        handler = RichHandler(console=console, rich_tracebacks=True)
+    else:
+        handler = RichHandler(console=console, rich_tracebacks=False)
     handler.setLevel(logging.DEBUG if verbose else logging.INFO)
 
     # Optional: only show the raw message (no "INFO" prefix, etc.)
@@ -248,33 +251,34 @@ def main():
         print("Excel Row | Host            | Message")
         print(60*"-")
     ###Connects to net_devices
+    logger = setup_logging(VERBOSE, tracebacks=False)
     """If you need to add more functions or to run more commands add them to the function below"""
     if TESTING:
         testing_connection(network_devices, work_book, GLBL_KEY_MAP)
         sys.exit()
     else:
-        connect_devices(network_devices, setup_vars, work_book, GLBL_KEY_MAP, INPUT_FILE_NAME)
+        connect_devices(network_devices, setup_vars, work_book, GLBL_KEY_MAP, INPUT_FILE_NAME, console_=console)
 
-    print_top_command_offenders(network_devices, top_n=20)
+    # print_top_command_offenders(network_devices, top_n=20)
     
     print_current_time()
 
     print("(6) Saving all the Device Data")
     # Clean up Passwords before that
     remove_passwords(work_book)
-    # Saves everything
-
-    """All Save features should be handled by this"""
-    #save_device_data(network_devices, work_book, setup_vars, GLBL_KEY_MAP)
     
-    # after all devices gathered + all results have been written to wb_obj:
-    headers_key = map_headers(wb_obj)  # or reuse existing headers_key if you already have it
+    # Saves everything
+    # """All Save features should be handled by this"""
+    # save_device_data(network_devices, work_book, setup_vars, GLBL_KEY_MAP)
+    
+    # after all devices gathered + all results have been written to work_book:
+    headers_key = map_headers(work_book)  # or reuse existing headers_key if you already have it
 
-    post_process_lldp_sheet_with_wtp_versions(wb_obj, headers_key, network_devices)
+    post_process_lldp_sheet_with_wtp_versions(work_book, headers_key, network_devices)
 
-    print("Saving XLSX file")
+    print("(7) Saving XLSX file")
     save_xls(work_book, INPUT_FILE_NAME, setup_vars["global"]["output_file"], setup_vars["global"]["output_dir"], VERBOSITY_LEVEL)
-    print(spacer + "(7) DONE with the script" + spacer)
+    print(spacer + "(8) DONE with the script" + spacer)
     
     print_current_time()
 

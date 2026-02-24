@@ -6,6 +6,9 @@ import orjson
 from datetime import datetime
 from pathlib import Path
 from time import perf_counter
+import logging
+
+logger = logging.getLogger("inventory")
 
 import openpyxl
 
@@ -258,7 +261,8 @@ def print_net_dev_msg(net_dev, msg):
     line2 = str(net_dev.host)
     if len(line2)<15:
         line2 += (15-len(line2))*" "
-    print(line1, "|", line2, "|", msg)
+    # print(line1, "|", line2, "|", msg)
+    logger.info(f"{line1} | {line2} | {msg}")
 
 def get_current_time(str_option="dt"):
     """
