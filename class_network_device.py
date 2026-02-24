@@ -6,6 +6,9 @@ from datetime import datetime
 
 import netmiko
 
+import logging
+logger = logging.getLogger("inventory")  # same name as main (or __name__)
+
 
 def get_current_time(str_option="dt"):
     now = datetime.now()
@@ -24,7 +27,7 @@ class NetworkDevice():
     """
     NetworkDevice class to handle and retain all output information.
     """
-    supported_devices = ["cisco_xr", "cisco_ios", "cisco_nxos", "extreme_exos"]
+    supported_devices = ["cisco_xr", "cisco_ios", "cisco_nxos", "extreme_exos", "fortinet", "fortinet_fortios","fortinet_fw"]
 
     def __init__(
             self,
@@ -65,6 +68,7 @@ class NetworkDevice():
         self.cmd_out_file = ""
         self.sfp_count = ""
         self.port = 0
+        self.fortinet_wtp_status = []
 
         # Track whether we still need to run SSHDetect
         self.needs_autodetect = (str(t_device_type).lower() == "autodetect")
@@ -100,16 +104,14 @@ class NetworkDevice():
             # default ssh port
             self.connection["port"] = 22
             self.port = 22
-            self.connection.update({
-                "fast_cli": True,
-                "global_delay_factor": 1,
-                # optionally also tune timeouts if you have slow banners/auth:
-                "conn_timeout": 10,
-                "banner_timeout": 15,
-                "auth_timeout": 15,
-            })
 
-        self.connection["global_delay_factor"] = 2
+        self.connection.setdefault("fast_cli", True)
+        #self.connection.setdefault("global_delay_factor", 1)
+        self.connection.setdefault("conn_timeout", 10)
+        self.connection.setdefault("banner_timeout", 15)
+        self.connection.setdefault("auth_timeout", 15)
+
+        #self.connection["global_delay_factor"] = 2
 
         # If NOT autodetect, set parse_method now
         if not self.needs_autodetect:
@@ -121,16 +123,21 @@ class NetworkDevice():
             self.add_error_msg(msg)
             self.active = "Error"
 
-    def detect_device_type(self):
+    def detect_device_type(self, verbose=False, console=None):
         """
         Detect device type using Netmiko SSHDetect.
         Must be run while connection['device_type'] == 'autodetect'.
         """
+        guesser = None
         try:
-            print(self.main_col, "|", self.host, "| Detecting Device Type")
+            # Removed to show in the rich panel
+            # print(self.main_col, "|", self.host, "| Detecting Device Type")
 
-            # Ensure SSHDetect requirement
+            # SSHDetect requirement
             self.connection["device_type"] = "autodetect"
+            self.connection.setdefault("conn_timeout", 7)
+            self.connection.setdefault("banner_timeout", 10)
+            self.connection.setdefault("auth_timeout", 10)
 
             guesser = netmiko.SSHDetect(**self.connection)
             best_match = guesser.autodetect()
@@ -140,25 +147,32 @@ class NetworkDevice():
                 self.add_error_msg(msg)
                 self.active = "Error"
                 best_match = "Unknown"
-            else:
-                print(self.main_col, "|", self.host, "| Device was detected as:", best_match)
 
             self.parse_method = best_match
             self.needs_autodetect = False
 
             # Update connection for later ConnectHandler()
-            # For SSH: keep base type (e.g., cisco_ios)
-            # For Telnet: Netmiko expects *_telnet
             if self.protocol == "telnet" and best_match not in ["Unknown", None, ""]:
                 self.connection["device_type"] = f"{best_match}_telnet"
             else:
                 self.connection["device_type"] = best_match
+            
+            return self.parse_method
 
         except Exception as e:
             self.add_detected_error(e)
             self.parse_method = "Unknown"
             self.active = "Error"
-
+            return "Unknown"
+        finally:
+            # IMPORTANT: close SSHDetect's internal connection if present
+            try:
+                if guesser and getattr(guesser, "connection", None):
+                    guesser.connection.disconnect()
+            except Exception:
+                pass
+            
+            
     def conn_error_detected(self, err_msg):
         """
         Add comment of connection error

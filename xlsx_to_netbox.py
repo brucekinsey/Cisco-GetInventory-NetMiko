@@ -1,4 +1,4 @@
-# e5AB5gQNtGy0dRfDleVbwCG95UUJHGYHNNW0HdjL
+# 
 
 #!/usr/bin/env python3
 
@@ -61,6 +61,9 @@ import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 from pynetbox.core.query import RequestError
+from datetime import datetime
+from pathlib import Path
+from time import perf_counter
 
 import openpyxl
 import pynetbox
@@ -69,6 +72,7 @@ import pynetbox
 DEFAULT_SITE_NAME = "SCDS IT Dept."
 DEFAULT_MANUFACTURER_CISCO = "Cisco"
 DEFAULT_DEVICE_ROLE_NAME = "Access Switch"
+VLAN_BEHAVIOR = "strict"
 
 
 # -----------------------------
@@ -78,10 +82,13 @@ ROLE_CACHE: Dict[str, Any] = {}
 MFG_CACHE: Dict[str, Any] = {}
 DEVTYPE_CACHE: Dict[Tuple[int, str], Any] = {}        # (manufacturer_id, model)
 VLAN_CACHE: Dict[Tuple[int, int], Any] = {}           # (site_id, vid)
+VLAN_GROUP_CACHE = {}
 IP_CACHE_BY_ADDRESS: Dict[str, Any] = {}              # "1.2.3.4/24" -> ip obj
 IP_CACHE_BY_HOST: Dict[str, Any] = {}                 # "1.2.3.4" -> ip obj
 
-
+class VlanScopeError(RuntimeError):
+    """Raised when a VLAN VID exists but is not in the expected Global group/scope."""
+    pass
 
 # -----------------------------
 # Inventory sheet -> Interface type override
@@ -109,6 +116,7 @@ INVENTORY_DESC_TO_NBTYPE: Dict[str, str] = {
     _norm_type_key("1000BaseLX SFP"): "1000base-lx",
     _norm_type_key("SFP-10GBase-LR"): "10gbase-lr",         # display: 10GBASE-LR
 }
+
 # -----------------------------
 # Helpers
 # -----------------------------
@@ -118,11 +126,9 @@ def slugify(s: str) -> str:
     s = re.sub(r"-{2,}", "-", s).strip("-")
     return s or "item"
 
-
 def map_device_status(v: Any) -> str:
     s = "" if v is None else str(v).strip().lower()
     return "active" if s in ("yes", "completed") else "offline"
-
 
 def parse_vlan_id(v: Any) -> Optional[int]:
     if v is None:
@@ -139,7 +145,6 @@ def parse_vlan_id(v: Any) -> Optional[int]:
     if m:
         return int(m.group(1))
     return None
-
 
 def expand_vlan_list(s: str) -> List[int]:
     vlans: List[int] = []
@@ -161,7 +166,6 @@ def expand_vlan_list(s: str) -> List[int]:
             except ValueError:
                 continue
     return sorted(set(vlans))
-
 
 def map_interface_type(human: Any, inventory_desc: Any = None) -> str:
     """Return NetBox interface type slug.
@@ -211,7 +215,6 @@ def map_interface_type(human: Any, inventory_desc: Any = None) -> str:
 
     return "other"
 
-
 def map_mode(v: Any) -> Optional[str]:
     if v is None:
         return None
@@ -226,19 +229,16 @@ def map_mode(v: Any) -> Optional[str]:
         return None
     return None
 
-
 def link_to_enabled(v: Any) -> bool:
     if v is None:
         return False
     s = str(v).strip().lower()
     return s in ("up", "down")
 
-
 def is_cisco_platform(platform_str: Any) -> bool:
     if platform_str is None:
         return False
     return "cisco_ios" in str(platform_str).lower()
-
 
 def resolve_mgmt_ip_with_mask(main_host: str, intfs_for_host: List[Dict[str, Any]]) -> Tuple[str, bool]:
     """Return (mgmt_ip_cidr, matched).
@@ -270,7 +270,6 @@ def resolve_mgmt_ip_with_mask(main_host: str, intfs_for_host: List[Dict[str, Any
 
     return f"{host}/24", False
 
-
 def prefer_mgmt_interface(intfs: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not intfs:
         return None
@@ -280,7 +279,6 @@ def prefer_mgmt_interface(intfs: List[Dict[str, Any]]) -> Optional[Dict[str, Any
             if str(r.get("name", "")).strip().lower() == wanted:
                 return r
     return intfs[0]
-
 
 def sheet_headers(ws) -> Dict[str, int]:
     hdr = {}
@@ -316,13 +314,13 @@ def pick_best_ip(ip_objs, desired_iface=None):
 
     return ip_objs[0]
 
+
 # Neighbor helpers go here:
 def _norm(s: Any) -> str:
     return "" if s is None else str(s).strip()
 
 def _key(host: Any, port: Any) -> Tuple[str, str]:
     return (_norm(host), _norm(port))
-
 
 def build_neighbors_from_cdp(ws_cdp) -> Dict[Tuple[str, str], str]:
     """
@@ -387,6 +385,239 @@ def build_neighbors_from_lldp(ws_lldp) -> Dict[Tuple[str, str], str]:
 
     return out
 
+def build_port_mgmtip_from_cdp(ws_cdp) -> Dict[Tuple[str, str], str]:
+    """
+    Return dict[(hostname, local_port)] = mgmt_ip
+
+    Match rule:
+      - CDP.Hostname + CDP.Local Port  <->  Interfaces.Hostname + Interfaces.Interface
+
+    Inclusion:
+      - requires Hostname, Local Port, MGMT IP (Remote Host not required for IP assignment)
+    """
+    hdr = sheet_headers(ws_cdp)
+    required = ["Hostname", "Local Port", "MGMT IP"]
+    for k in required:
+        if k not in hdr:
+            raise RuntimeError(f"Sheet '{ws_cdp.title}' missing required header '{k}'")
+
+    out: Dict[Tuple[str, str], str] = {}
+    for r in range(2, ws_cdp.max_row + 1):
+        host = ws_cdp.cell(row=r, column=hdr["Hostname"]).value
+        local = ws_cdp.cell(row=r, column=hdr["Local Port"]).value
+        mgmt = ws_cdp.cell(row=r, column=hdr["MGMT IP"]).value
+
+        if not _norm(host) or not _norm(local) or not _norm(mgmt):
+            continue
+
+        out[_key(host, local)] = _norm(mgmt)
+
+    return out
+
+def build_port_mgmtip_from_lldp(ws_lldp) -> Dict[Tuple[str, str], str]:
+    """
+    Return dict[(hostname, local_port)] = mgmt_ip
+
+    Match rule:
+      - LLDP.Hostname + LLDP.Local Port  <->  Interfaces.Hostname + Interfaces.Short IF
+
+    Inclusion:
+      - requires Hostname, Local Port, MGMT IP
+    """
+    hdr = sheet_headers(ws_lldp)
+    required = ["Hostname", "Local Port", "MGMT IP"]
+    for k in required:
+        if k not in hdr:
+            raise RuntimeError(f"Sheet '{ws_lldp.title}' missing required header '{k}'")
+
+    out: Dict[Tuple[str, str], str] = {}
+    for r in range(2, ws_lldp.max_row + 1):
+        host = ws_lldp.cell(row=r, column=hdr["Hostname"]).value
+        local = ws_lldp.cell(row=r, column=hdr["Local Port"]).value
+        mgmt = ws_lldp.cell(row=r, column=hdr["MGMT IP"]).value
+
+        if not _norm(host) or not _norm(local) or not _norm(mgmt):
+            continue
+
+        out[_key(host, local)] = _norm(mgmt)
+
+    return out
+
+def normalize_device_name(name: str) -> str:
+    """Strip FQDN and whitespace: 'SCDS_XYZ.domain.tld' -> 'SCDS_XYZ'."""
+    s = (name or "").strip()
+    if not s:
+        return s
+    return s.split(".", 1)[0]
+
+def normalize_mac(s: Any) -> str:
+    """Normalize mac strings like '0c85.255c.0e00' or '0C:85:25:5C:0E:00' -> '0c85255c0e00'."""
+    if s is None:
+        return ""
+    return re.sub(r"[^0-9a-fA-F]", "", str(s)).lower()
+
+def expand_cisco_ifname(port: str) -> str:
+    """
+    Expand common Cisco abbreviations:
+      Te1/1 -> TenGigabitEthernet1/1
+      Gi1/0/1 -> GigabitEthernet1/0/1
+      Fa0/1 -> FastEthernet0/1
+      Po1 -> Port-channel1
+    If already long-form, return as-is.
+    """
+    p = (port or "").strip()
+    if not p:
+        return p
+
+    # Already long-ish
+    if p.lower().startswith(("tengigabitethernet", "gigabitethernet", "fastethernet", "port-channel", "ethernet")):
+        return p
+
+    m = re.match(r"^(Te|Gi|Fa|Po|Eth)\s*(.+)$", p, re.IGNORECASE)
+    if not m:
+        return p
+
+    pref, rest = m.group(1).lower(), m.group(2).strip()
+    if pref == "te":
+        return f"TenGigabitEthernet{rest}"
+    if pref == "gi":
+        return f"GigabitEthernet{rest}"
+    if pref == "fa":
+        return f"FastEthernet{rest}"
+    if pref == "po":
+        return f"Port-channel{rest}"
+    if pref == "eth":
+        return f"Ethernet{rest}"
+    return p
+
+def ensure_cable_between_interfaces_orig(nb, a_intf, b_intf, commit: bool) -> None:
+    """
+    Create a cable between a_intf and b_intf if neither is already cabled.
+    Only creates if both interface objects exist (callers ensure that).
+    """
+    if getattr(a_intf, "cable", None) or getattr(b_intf, "cable", None):
+        return
+
+    if not commit:
+        print(f"[DRY] Would cable {a_intf.device.name}:{a_intf.name} <-> {b_intf.device.name}:{b_intf.name}")
+        return
+
+    nb.dcim.cables.create({
+        "termination_a_type": "dcim.interface",
+        "termination_a_id": a_intf.id,
+        "termination_b_type": "dcim.interface",
+        "termination_b_id": b_intf.id,
+        "status": "connected",
+    })
+
+def ensure_cable_between_interfaces(nb, a_intf, b_intf, commit: bool) -> None:
+    """
+    Create a cable between a_intf and b_intf.
+    - Uses NetBox v3.3+ cable API (a_terminations/b_terminations)
+    - Never raises RequestError (so you don't skip the whole device)
+    - Only creates if both ends exist and neither end is already cabled
+    """
+    if not a_intf or not b_intf:
+        return
+
+    a_id = getattr(a_intf, "id", None)
+    b_id = getattr(b_intf, "id", None)
+    if not a_id or not b_id:
+        return
+
+    # If either end already has a cable, don't touch it
+    if getattr(a_intf, "cable", None) or getattr(b_intf, "cable", None):
+        return
+
+    payload = {
+        "status": "connected",
+        "a_terminations": [{"object_type": "dcim.interface", "object_id": a_id}],
+        "b_terminations": [{"object_type": "dcim.interface", "object_id": b_id}],
+    }
+
+    if not commit:
+        print(f"[DRY] Would cable {a_intf.device.name}:{a_intf.name} <-> {b_intf.device.name}:{b_intf.name}")
+        return
+
+    try:
+        nb.dcim.cables.create(payload)
+    except RequestError as e:
+        print(
+            f"[WARN] Cable create failed for {a_intf.device.name}:{a_intf.name} <-> "
+            f"{b_intf.device.name}:{b_intf.name}: {e}"
+        )
+        return
+
+def build_cdp_links(ws_cdp) -> Dict[Tuple[str, str], Tuple[str, str]]:
+    """
+    (local_host, local_port) -> (remote_host, remote_port)
+    """
+    hdr = sheet_headers(ws_cdp)
+    required = ["Hostname", "Local Port", "Remote Host", "Remote Port"]
+    for k in required:
+        if k not in hdr:
+            raise RuntimeError(f"Sheet '{ws_cdp.title}' missing required header '{k}'")
+
+    out: Dict[Tuple[str, str], Tuple[str, str]] = {}
+    for r in range(2, ws_cdp.max_row + 1):
+        lh = normalize_device_name(_norm(ws_cdp.cell(row=r, column=hdr["Hostname"]).value))
+        lp = _norm(ws_cdp.cell(row=r, column=hdr["Local Port"]).value)
+        rh = normalize_device_name(_norm(ws_cdp.cell(row=r, column=hdr["Remote Host"]).value))
+        rp = _norm(ws_cdp.cell(row=r, column=hdr["Remote Port"]).value)
+        if not (lh and lp and rh and rp):
+            continue
+        out[(lh, lp)] = (rh, rp)
+    return out
+
+
+def build_lldp_links(ws_lldp, interfaces_by_host: Dict[str, List[Dict[str, Any]]]) -> Dict[Tuple[str, str], Tuple[str, str]]:
+    """
+    (local_host, local_port) -> (remote_host, remote_port)
+
+    If Local Port is blank, use Chassis ID as a MAC pointer:
+      - chassis_id == Interfaces!MAC Add for the local interface
+      - then use that interface's 'short_if' (preferred) or full 'name'
+    """
+    hdr = sheet_headers(ws_lldp)
+    required = ["Hostname", "Chassis ID", "Local Port", "Remote Host", "Remote Port"]
+    for k in required:
+        if k not in hdr:
+            raise RuntimeError(f"Sheet '{ws_lldp.title}' missing required header '{k}'")
+
+    # Build per-host MAC->(short_if/full_name)
+    mac_index: Dict[Tuple[str, str], str] = {}
+    for host, rows in interfaces_by_host.items():
+        h = normalize_device_name(host)
+        for row in rows:
+            m = normalize_mac(row.get("mac"))
+            if not m:
+                continue
+            # Prefer short_if because LLDP often uses Te1/1 style
+            mac_index[(h, m)] = row.get("short_if") or row.get("name") or ""
+
+    out: Dict[Tuple[str, str], Tuple[str, str]] = {}
+    for r in range(2, ws_lldp.max_row + 1):
+        lh = normalize_device_name(_norm(ws_lldp.cell(row=r, column=hdr["Hostname"]).value))
+        chassis = _norm(ws_lldp.cell(row=r, column=hdr["Chassis ID"]).value)
+        lp = _norm(ws_lldp.cell(row=r, column=hdr["Local Port"]).value)
+        rh = normalize_device_name(_norm(ws_lldp.cell(row=r, column=hdr["Remote Host"]).value))
+        rp = _norm(ws_lldp.cell(row=r, column=hdr["Remote Port"]).value)
+
+        if not (lh and rh and rp):
+            continue
+
+        # Local Port missing: resolve via chassis-id MAC -> Interfaces.MAC Add
+        if not lp and chassis:
+            lp = mac_index.get((lh, normalize_mac(chassis)), "")
+
+        if not lp:
+            continue
+
+        out[(lh, lp)] = (rh, rp)
+
+    return out
+
+
 # -----------------------------
 # NetBox helpers (cached)
 # -----------------------------
@@ -395,7 +626,6 @@ def nb_get_or_create_site(nb, site_name: str) -> Any:
     if site:
         return site
     raise RuntimeError(f"Site '{site_name}' not found in NetBox (expected to exist).")
-
 
 def nb_get_or_create_manufacturer(nb, name: str, commit: bool) -> Any:
     if name in MFG_CACHE:
@@ -412,7 +642,6 @@ def nb_get_or_create_manufacturer(nb, name: str, commit: bool) -> Any:
     MFG_CACHE[name] = m
     return m
 
-
 def nb_get_or_create_role(nb, name: str, commit: bool) -> Any:
     if name in ROLE_CACHE:
         return ROLE_CACHE[name]
@@ -427,7 +656,6 @@ def nb_get_or_create_role(nb, name: str, commit: bool) -> Any:
     r = nb.dcim.device_roles.create(name=name, slug=slugify(name))
     ROLE_CACHE[name] = r
     return r
-
 
 def nb_get_or_create_device_type(nb, manufacturer_id: int, model: str, commit: bool) -> Any:
     key = (manufacturer_id, model)
@@ -446,8 +674,39 @@ def nb_get_or_create_device_type(nb, manufacturer_id: int, model: str, commit: b
     DEVTYPE_CACHE[key] = dt
     return dt
 
+def nb_get_or_create_vlan_group_orig(nb, name: str = "Global", commit: bool = True):
+    """
+    Ensure VLAN group exists and return it.
+    """
+    vg = nb.ipam.vlan_groups.get(name=name)
+    if vg:
+        return vg
 
-def nb_get_or_create_vlan(nb, site_id: int, vid: int, commit: bool) -> Any:
+    if not commit:
+        # dry run: return None or a small stub if your code expects .id
+        return None
+
+    return nb.ipam.vlan_groups.create({"name": name, "slug": name.lower().replace(" ", "-")})
+
+def nb_get_or_create_vlan_group(nb, name: str, commit: bool):
+    if name in VLAN_GROUP_CACHE:
+        return VLAN_GROUP_CACHE[name]
+
+    vg = nb.ipam.vlan_groups.get(name=name)
+    if vg:
+        VLAN_GROUP_CACHE[name] = vg
+        return vg
+
+    if not commit:
+        obj = type("Obj", (), {"id": -1, "name": name})
+        VLAN_GROUP_CACHE[name] = obj
+        return obj
+
+    vg = nb.ipam.vlan_groups.create(name=name, slug=slugify(name))
+    VLAN_GROUP_CACHE[name] = vg
+    return vg
+
+def nb_get_or_create_vlan_orig(nb, site_id: int, vid: int, commit: bool) -> Any:
     key = (site_id, vid)
     if key in VLAN_CACHE:
         return VLAN_CACHE[key]
@@ -462,6 +721,86 @@ def nb_get_or_create_vlan(nb, site_id: int, vid: int, commit: bool) -> Any:
         return obj
     vlan = nb.ipam.vlans.create(**payload)
     VLAN_CACHE[key] = vlan
+    return vlan
+
+
+# global flag set in main: VLAN_BEHAVIOR = "strict" or "normalize"
+# requires: nb_get_or_create_vlan_group(), VlanScopeError, VLAN_CACHE
+def nb_get_or_create_vlan(nb, site_id: int, vid: int, commit: bool) -> Any:
+    """
+    Global VLAN logic; only difference between modes is how we handle VID that exists outside Global.
+
+    Both modes:
+      - If VID exists in Global:
+          * if duplicates, use lowest-id canonical and continue (warn)
+      - If VID does not exist anywhere: create it in Global (site=None)
+
+    strict:
+      - If VID exists outside Global (but not in Global): raise VlanScopeError
+
+    normalize:
+      - If VID exists outside Global (but not in Global): move it into Global and clear site (site=None)
+    """
+    global VLAN_BEHAVIOR
+
+    vid = int(vid)
+    cache_key = ("Global", vid)
+    if cache_key in VLAN_CACHE:
+        return VLAN_CACHE[cache_key]
+
+    vg = nb_get_or_create_vlan_group(nb, "Global", commit)
+    vg_id = getattr(vg, "id", vg)
+
+    # 1) Look in Global by VID
+    global_matches = list(nb.ipam.vlans.filter(group_id=vg_id, vid=vid))
+    if global_matches:
+        # duplicates -> canonicalize (lowest id) and continue
+        global_matches = sorted(global_matches, key=lambda v: v.id)
+        canonical = global_matches[0]
+        if len(global_matches) > 1:
+            print(
+                f"[WARN] Duplicate VLANs in Global for VID {vid}: {[v.id for v in global_matches]}. "
+                f"Using canonical id={canonical.id}."
+            )
+        VLAN_CACHE[cache_key] = canonical
+        return canonical
+
+    # 2) Not in Global. Does it exist elsewhere?
+    elsewhere = list(nb.ipam.vlans.filter(vid=vid))
+    if elsewhere:
+        # pick lowest id elsewhere (deterministic)
+        elsewhere = sorted(elsewhere, key=lambda v: v.id)
+        vlan = elsewhere[0]
+
+        grp = getattr(getattr(vlan, "group", None), "name", None)
+        site = getattr(getattr(vlan, "site", None), "name", None)
+
+        if VLAN_BEHAVIOR == "strict":
+            raise VlanScopeError(
+                f"VID {vid} exists outside Global (vlan_id={vlan.id}, group={grp!r}, site={site!r}); "
+                f"strict mode refuses to move it."
+            )
+
+        # normalize: move into Global + clear site
+        if not commit:
+            obj = type("Obj", (), {"id": vlan.id, "vid": vid})
+            VLAN_CACHE[cache_key] = obj
+            return obj
+
+        vlan.update({"group": vg_id, "site": None})
+        VLAN_CACHE[cache_key] = vlan
+        return vlan
+
+    # 3) Doesn't exist anywhere -> create in Global
+    payload = {"site": None, "group": vg_id, "vid": vid, "name": f"VLAN{vid}", "status": "active"}
+
+    if not commit:
+        obj = type("Obj", (), {"id": -1, "vid": vid})
+        VLAN_CACHE[cache_key] = obj
+        return obj
+
+    vlan = nb.ipam.vlans.create(**payload)
+    VLAN_CACHE[cache_key] = vlan
     return vlan
 
 def nb_get_or_create_ip(nb, address: str, commit: bool) -> Any:
@@ -555,7 +894,6 @@ def nb_get_or_create_ip(nb, address: str, commit: bool) -> Any:
     IP_CACHE_BY_ADDRESS[desired_str] = created
     IP_CACHE_BY_HOST[host_str] = created
     return created
-
 
 def ensure_ips_exist_bulk(nb, ip_addrs: List[str], commit: bool) -> None:
     """Bulk create IPs that don't exist.
@@ -679,8 +1017,7 @@ def load_main_devices(ws_main) -> List[Dict[str, Any]]:
         )
     return devices
 
-
-def load_interfaces(ws_intf) -> Dict[str, List[Dict[str, Any]]]:
+def load_interfaces_orig(ws_intf) -> Dict[str, List[Dict[str, Any]]]:
     by_host: Dict[str, List[Dict[str, Any]]] = {}
     for r in range(2, ws_intf.max_row + 1):
         hostname = ws_intf.cell(row=r, column=1).value
@@ -706,6 +1043,33 @@ def load_interfaces(ws_intf) -> Dict[str, List[Dict[str, Any]]]:
         by_host.setdefault(rec["hostname"], []).append(rec)
     return by_host
 
+def load_interfaces(ws_intf) -> Dict[str, List[Dict[str, Any]]]:
+    by_host: Dict[str, List[Dict[str, Any]]] = {}
+    for r in range(2, ws_intf.max_row + 1):
+        hostname = ws_intf.cell(row=r, column=1).value
+        if hostname is None or str(hostname).strip() == "":
+            continue
+        if_name = ws_intf.cell(row=r, column=2).value
+        short_if = ws_intf.cell(row=r, column=3).value
+        if if_name is None or str(if_name).strip() == "":
+            continue
+
+        rec = {
+            "hostname": str(hostname).strip(),
+            "name": str(if_name).strip(),
+            "short_if": "" if short_if is None else str(short_if).strip(),
+            "description": "" if ws_intf.cell(row=r, column=4).value is None else str(ws_intf.cell(row=r, column=4).value).strip(),
+            "type_human": ws_intf.cell(row=r, column=5).value,
+            "link": ws_intf.cell(row=r, column=7).value,
+            "mode_raw": ws_intf.cell(row=r, column=10).value,
+            "access_vlan_raw": ws_intf.cell(row=r, column=11).value,
+            "tagged_vlans_raw": ws_intf.cell(row=r, column=14).value,
+            "mac": ws_intf.cell(row=r, column=15).value,      # ✅ MAC Add (O)
+            "ip_address": ws_intf.cell(row=r, column=16).value,
+            "mtu": ws_intf.cell(row=r, column=17).value,
+        }
+        by_host.setdefault(rec["hostname"], []).append(rec)
+    return by_host
 
 def load_inventory_type_overrides(ws_inv) -> Dict[Tuple[str, str], str]:
     """Return {(hostname, interface_name): description} from the Inventory sheet."""
@@ -735,8 +1099,6 @@ def load_inventory_type_overrides(ws_inv) -> Dict[Tuple[str, str], str]:
             continue
         out[(str(host).strip(), str(dev).strip())] = str(desc).strip()
     return out
-
-
 
 def load_neighbors(ws, force_platform_blank: bool) -> Dict[str, List[Dict[str, str]]]:
     hdr = sheet_headers(ws)
@@ -829,10 +1191,8 @@ def upsert_device(nb, site, device_row: Dict[str, Any], commit: bool) -> Any:
 
     return nb.dcim.devices.create(**payload)
 
-
 def prefetch_interfaces_for_device(nb, device_id: int) -> Dict[str, Any]:
     return {i.name: i for i in nb.dcim.interfaces.filter(device_id=device_id)}
-
 
 def bulk_create_missing_interfaces(nb, device, intfs: List[Dict[str, Any]], existing_by_name: Dict[str, Any], inv_type_by_host_intf: Dict[Tuple[str, str], str], commit: bool) -> Dict[str, Any]:
     to_create: List[Dict[str, Any]] = []
@@ -880,7 +1240,6 @@ def bulk_create_missing_interfaces(nb, device, intfs: List[Dict[str, Any]], exis
     # Re-fetch once to get ids
     return prefetch_interfaces_for_device(nb, device.id)
 
-
 def upsert_interface_fields(nb_intf, desired: Dict[str, Any], commit: bool) -> None:
     if not commit:
         return
@@ -896,8 +1255,7 @@ def upsert_interface_fields(nb_intf, desired: Dict[str, Any], commit: bool) -> N
     if changed:
         nb_intf.save()
 
-
-def set_interface_vlans(nb, site, nb_intf, mode: Optional[str], access_vlan_raw: Any, tagged_vlans_raw: Any, commit: bool) -> None:
+def set_interface_vlans_orig(nb, site, nb_intf, mode: Optional[str], access_vlan_raw: Any, tagged_vlans_raw: Any, commit: bool) -> None:
     if mode not in ("access", "tagged"):
         return
 
@@ -942,8 +1300,70 @@ def set_interface_vlans(nb, site, nb_intf, mode: Optional[str], access_vlan_raw:
     if changed:
         nb_intf.save()
 
+def set_interface_vlans(nb, site, nb_intf, mode: Optional[str], access_vlan_raw: Any, tagged_vlans_raw: Any, commit: bool) -> None:
+    if mode not in ("access", "tagged"):
+        return
 
-def assign_ip_to_interface(nb, nb_intf, ip_addr: str, commit: bool) -> None:
+    dev_name = getattr(getattr(nb_intf, "device", None), "name", "<unknown-device>")
+    intf_name = getattr(nb_intf, "name", "<unknown-intf>")
+
+    # Precompute some helpful context for logging
+    native_str = "" if access_vlan_raw is None else str(access_vlan_raw).strip()
+    tagged_str = "" if tagged_vlans_raw is None else str(tagged_vlans_raw).strip()
+
+    try:
+        desired_untagged: Optional[int] = None
+        desired_tagged: List[int] = []
+
+        if mode == "access":
+            vid = parse_vlan_id(access_vlan_raw)
+            if vid is not None:
+                vlan = nb_get_or_create_vlan(nb, site.id, vid, commit)
+                desired_untagged = vlan.id
+            desired_tagged = []
+
+        elif mode == "tagged":
+            native_vid = parse_vlan_id(access_vlan_raw)
+            if native_vid is not None:
+                vlan = nb_get_or_create_vlan(nb, site.id, native_vid, commit)
+                desired_untagged = vlan.id
+
+            allowed = expand_vlan_list(tagged_str)
+            for vid in allowed:
+                vlan = nb_get_or_create_vlan(nb, site.id, vid, commit)
+                desired_tagged.append(vlan.id)
+
+    except (VlanScopeError, RuntimeError) as e:
+        # Fail loudly for THIS interface, continue the rest of the run
+        # - VlanScopeError: VID exists outside Global in strict mode
+        # - RuntimeError: duplicates in Global (or any other explicit RuntimeError you raise)
+        print(
+            f"[SKIP] VLAN assignment for {dev_name}:{intf_name} "
+            f"(mode={mode}, native/access={native_str!r}, tagged={tagged_str!r}) -> {e}"
+        )
+        return
+
+    if not commit:
+        return
+
+    # Compare current vs desired IDs
+    cur_untagged = getattr(nb_intf, "untagged_vlan", None)
+    cur_untagged_id = getattr(cur_untagged, "id", cur_untagged) if cur_untagged else None
+    cur_tagged = getattr(nb_intf, "tagged_vlans", None) or []
+    cur_tagged_ids = sorted([getattr(v, "id", v) for v in cur_tagged])
+    desired_tagged_ids = sorted(desired_tagged)
+
+    changed = False
+    if cur_untagged_id != desired_untagged:
+        nb_intf.untagged_vlan = desired_untagged
+        changed = True
+    if cur_tagged_ids != desired_tagged_ids:
+        nb_intf.tagged_vlans = desired_tagged_ids
+        changed = True
+    if changed:
+        nb_intf.save()
+
+def assign_ip_to_interface_orig(nb, nb_intf, ip_addr: str, commit: bool) -> None:
     """
     Assign an IP to an interface.
 
@@ -982,6 +1402,91 @@ def assign_ip_to_interface(nb, nb_intf, ip_addr: str, commit: bool) -> None:
         }]
     )
 
+def assign_ip_to_interface(nb, nb_intf, ip_addr: str, commit: bool) -> None:
+    """
+    Assign an IP to an interface.
+
+    NetBox restriction:
+      - You cannot reassign an IP address (change assigned_object) while that IP
+        is designated as the device's primary_ip4.
+
+    Fix:
+      - If the IP is currently the device primary_ip4, temporarily clear it,
+        patch the IP assignment, then allow later code (set_device_primary_ip4)
+        to set it back.
+    """
+    if not ip_addr:
+        return
+
+    ip_obj = nb_get_or_create_ip(nb, ip_addr, commit)
+
+    if not commit:
+        return
+
+    ip_id = getattr(ip_obj, "id", None)
+    if not ip_id and isinstance(ip_obj, dict):
+        ip_id = ip_obj.get("id")
+    if not ip_id:
+        raise RuntimeError(f"Cannot assign IP (no id): {ip_addr!r}")
+
+    # Fetch current IP object to avoid unnecessary PATCH
+    cur_ip = nb.ipam.ip_addresses.get(ip_id)
+    need = (
+        getattr(cur_ip, "assigned_object_type", None) != "dcim.interface"
+        or getattr(cur_ip, "assigned_object_id", None) != nb_intf.id
+    )
+    if not need:
+        return
+
+    # Resolve device id from interface
+    dev_ref = getattr(nb_intf, "device", None)
+    dev_id = getattr(dev_ref, "id", dev_ref) if dev_ref else None
+
+    # If some OTHER device is using this as primary_ip4, don't touch it
+    # (avoids blowing up on shared/bad data)
+    owners = list(nb.dcim.devices.filter(primary_ip4_id=ip_id))
+    if owners and dev_id and owners[0].id != dev_id:
+        print(
+            f"[WARN] IP {ip_addr} is primary_ip4 for device '{owners[0].name}', "
+            f"skipping assignment to {getattr(nb_intf, 'name', nb_intf.id)}"
+        )
+        return
+
+    cleared_primary = False
+    old_primary_id = None
+
+    try:
+        # If THIS device has this IP as primary, clear it temporarily
+        if dev_id:
+            dev = nb.dcim.devices.get(dev_id)
+            prim = getattr(dev, "primary_ip4", None)
+            prim_id = getattr(prim, "id", prim) if prim else None
+
+            if prim_id == ip_id:
+                old_primary_id = prim_id
+                dev.primary_ip4 = None
+                dev.save()
+                cleared_primary = True
+
+        # PATCH only the assignment fields
+        nb.ipam.ip_addresses.update(
+            [{
+                "id": ip_id,
+                "assigned_object_type": "dcim.interface",
+                "assigned_object_id": nb_intf.id,
+            }]
+        )
+
+    except Exception:
+        # If we cleared primary and assignment failed, restore primary immediately
+        if cleared_primary and dev_id and old_primary_id:
+            try:
+                dev = nb.dcim.devices.get(dev_id)
+                dev.primary_ip4 = old_primary_id
+                dev.save()
+            except Exception:
+                pass
+        raise
 
 def set_device_primary_ip4(nb, device, mgmt_ip_cidr: str, commit: bool) -> None:
     if not mgmt_ip_cidr:
@@ -996,11 +1501,9 @@ def set_device_primary_ip4(nb, device, mgmt_ip_cidr: str, commit: bool) -> None:
         dev.primary_ip4 = ip_obj.id
         dev.save()
 
-
 def build_neighbors_json(device_name: str, mgmt_ip: str, cdp_by_host: Dict[str, List[Dict[str, str]]], lldp_by_host: Dict[str, List[Dict[str, str]]]) -> str:
     payload = {"device": device_name, "mgmt_ip": mgmt_ip, "cdp": cdp_by_host.get(device_name, []), "lldp": lldp_by_host.get(device_name, [])}
     return json.dumps(payload, indent=2, sort_keys=True)
-
 
 def set_device_custom_field(nb, device_name: str, field: str, value: str, commit: bool) -> None:
     if not commit:
@@ -1012,6 +1515,25 @@ def set_device_custom_field(nb, device_name: str, field: str, value: str, commit
         dev.custom_fields[field] = value
         dev.save()
 
+def get_current_time(str_option="dt"):
+    """
+    Captures the current time and returns it. Will return both date
+    and time, or just one depending on the str_option provided.
+    """
+    now = datetime.now()
+    str_option = str_option.lower()
+    if str_option == "dt":
+        return now.strftime("%m/%d/%Y") + ", " + now.strftime("%H:%M:%S")
+    if str_option == "d":
+        return now.strftime("%m/%d/%Y")
+    if str_option == "t":
+        return now.strftime("%H:%M:%S")
+    return "Invalid selection.  Choose d for date, t for time, or dt for date + time."
+
+def print_current_time():
+    # Get the current time
+    current_time = get_current_time("t")
+    print("Current Time:", current_time)
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Import devices/interfaces/IPs from XLSX into NetBox (optimized)")
@@ -1020,41 +1542,59 @@ def main() -> None:
     parser.add_argument("--token", default=os.environ.get("NETBOX_TOKEN"), help="NetBox API token (or env NETBOX_TOKEN)")
     parser.add_argument("--site", default=DEFAULT_SITE_NAME, help=f"NetBox site name (default: {DEFAULT_SITE_NAME})")
     parser.add_argument("--dry-run", action="store_true", help="Print actions only; do not create/update in NetBox")
+    parser.add_argument("--vlan-normalize", action="store_true", help="Normalize VLANs into Global: pick lowest id if duplicates in Global; \n move VLANs with matching VID from other groups/sites into Global (site=None) instead of creating a new VLAN."
+)
     args = parser.parse_args()
 
     if not args.token:
         raise SystemExit("NetBox token not provided. Use --token or set NETBOX_TOKEN.")
 
     commit = not args.dry_run
+    VLAN_BEHAVIOR = "normalize" if args.vlan_normalize else "strict"
 
+    print_current_time()
+    t0 = perf_counter()
     print(f"NetBox URL: {args.url}")
     print(f"XLSX: {args.xlsx}")
     print(f"Site: {args.site}")
     print("Mode:", "COMMIT" if commit else "DRY-RUN")
 
     # threading=True improves performance for large paginated fetches
+    print("Setting netbox obj")
     nb = pynetbox.api(args.url, token=args.token, threading=True)
 
+    print("Loading workbook obj")
     wb = openpyxl.load_workbook(args.xlsx, data_only=True)
+    print("Looping workbook obj")
     for required in ("Main", "Interfaces", "CDP", "LLDP"):
         if required not in wb.sheetnames:
             raise RuntimeError(f"Workbook missing sheet '{required}'")
 
+    print("Checking workbook obj")
     ws_inv = wb["Inventory"] if "Inventory" in wb.sheetnames else None
-
     ws_main = wb["Main"]
     ws_intf = wb["Interfaces"]
     ws_cdp = wb["CDP"]
     ws_lldp = wb["LLDP"]
+
+    print("Processing interfaces and links")
+    interfaces_by_host = load_interfaces(ws_intf)
+    cdp_links = build_cdp_links(ws_cdp)
+    lldp_links = build_lldp_links(ws_lldp, interfaces_by_host)
     
     # Neighbor maps for interface descriptions
     cdp_port_remote = build_neighbors_from_cdp(ws_cdp)
     lldp_port_desc = build_neighbors_from_lldp(ws_lldp)
+    
+    # Neighbor maps for interface IP assignment (MGMT IP)
+    cdp_port_mgmtip = build_port_mgmtip_from_cdp(ws_cdp)
+    lldp_port_mgmtip = build_port_mgmtip_from_lldp(ws_lldp)
 
+    print("Processing sites")
     site = nb_get_or_create_site(nb, args.site)
 
     devices = load_main_devices(ws_main)
-    interfaces_by_host = load_interfaces(ws_intf)
+    
     inv_type_by_host_intf = load_inventory_type_overrides(ws_inv) if ws_inv is not None else {}
     cdp_by_host = load_neighbors(ws_cdp, force_platform_blank=False)
     lldp_by_host = load_neighbors(ws_lldp, force_platform_blank=True)
@@ -1109,7 +1649,50 @@ def main() -> None:
                     # Shouldn't happen after bulk create + prefetch, but safe
                     continue
 
-                # --- NEW: neighbor description overlay (LLDP first, then CDP) ---
+                # --- Cable creation (CDP preferred, then LLDP) ---
+                local_host = normalize_device_name(row.get("hostname", ""))
+                local_full = row.get("name", "")
+                local_short = row.get("short_if", "")
+
+                remote = None
+
+                # CDP keys use full local port names in your sheet (TenGigabitEthernet1/15)
+                if local_host and local_full:
+                    remote = cdp_links.get((local_host, local_full))
+
+                # LLDP keys often use short local ports (Te1/15). Also supports MAC->port fallback.
+                if not remote and local_host and local_short:
+                    remote = lldp_links.get((local_host, local_short))
+
+                if remote:
+                    remote_host, remote_port = remote
+                    remote_host = normalize_device_name(remote_host)
+
+                    r_dev = nb.dcim.devices.get(name=remote_host)
+                    if not r_dev:
+                        # If NetBox stores the FQDN (rare), try original as fallback
+                        r_dev = nb.dcim.devices.get(name=remote_host.strip())
+
+                    if not r_dev:
+                        print(f"[WARN] Remote device not found: {remote_host!r} (for {dev.name}:{nb_intf.name})")
+                    else:
+                        # Try remote port as-is, then expanded Cisco long form
+                        cand_ports = [remote_port, expand_cisco_ifname(remote_port)]
+                        r_intf = None
+                        for p in cand_ports:
+                            if not p:
+                                continue
+                            r_intf = nb.dcim.interfaces.get(device_id=r_dev.id, name=p)
+                            if r_intf:
+                                break
+
+                        if not r_intf:
+                            print(f"[WARN] Remote interface not found: {r_dev.name}:{remote_port!r} (for {dev.name}:{nb_intf.name})")
+                        else:
+                            ensure_cable_between_interfaces(nb, nb_intf, r_intf, commit)
+                # --- end cable creation ---
+
+                # --- Neighbor description overlay (LLDP first, then CDP) ---
                 host = row.get("hostname", "")
                 short_if = row.get("short_if", "")
                 full_if = row.get("name", "")
@@ -1152,6 +1735,26 @@ def main() -> None:
                 set_interface_vlans(nb, site, nb_intf, mode, row.get("access_vlan_raw"), row.get("tagged_vlans_raw"), commit)
 
                 ip_val = row.get("ip_address")
+
+                # If Interfaces sheet IP is blank, fall back to LLDP/CDP MGMT IP (if present)
+                if not ip_val:
+                    host = row.get("hostname", "")
+                    short_if = row.get("short_if", "")
+                    full_if = row.get("name", "")
+
+                    nbr_ip = None
+                    # LLDP uses Short IF
+                    if host and short_if:
+                        nbr_ip = lldp_port_mgmtip.get(_key(host, short_if))
+                    # CDP uses full interface name
+                    if not nbr_ip and host and full_if:
+                        nbr_ip = cdp_port_mgmtip.get(_key(host, full_if))
+
+                    if nbr_ip:
+                        # MGMT IPs in CDP/LLDP sheets are typically host-only (no mask)
+                        # Use /32 by default to avoid guessing the wrong subnet.
+                        ip_val = f"{nbr_ip}/32" if "/" not in nbr_ip else nbr_ip
+
                 if ip_val:
                     assign_ip_to_interface(nb, nb_intf, str(ip_val).strip(), commit)
 
@@ -1172,8 +1775,9 @@ def main() -> None:
             # Optional: keep the run going even for unexpected errors
             print(f"[SKIP] Unexpected error for device '{d.get('name', '<unknown>')}'. Skipping. Error: {e}")
             continue
+    delta_timer = perf_counter() - t0
     print("Done.")
-
+    print(f"{delta_timer:.3f}s to finish")
 
 if __name__ == "__main__":
     main()

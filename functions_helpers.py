@@ -5,10 +5,14 @@ import re
 import orjson
 from datetime import datetime
 from pathlib import Path
+from time import perf_counter
 
 import openpyxl
 
+VERBOSE = False
+
 def load_device_type_cache(cache_path="device_type_cache.json"):
+    print("Loading ", cache_path)
     try:
         #with open(cache_path, "r") as f:
             #return json.load(f)
@@ -18,6 +22,9 @@ def load_device_type_cache(cache_path="device_type_cache.json"):
         return {}
 
 def save_device_type_cache(cache, cache_path="device_type_cache.json"):
+    if VERBOSE:
+        print("Saving ", cache_path)
+
     try:
         #with open(cache_path, "w") as f:
             #json.dump(cache, f, indent=2, sort_keys=True)
@@ -184,28 +191,7 @@ def open_xls(xls_input_file_name):
         print(e)
         print("Please ensure the file exists or the correct filename was entered when utilizing the \"-i\" argument.")
 
-def save_xls_old(wb_obj, file_name=None, output_dir=None, input_file_name=None):
-    """
-    Saves the WorkBook to provided Directory and File Name.
-    If no file_name provided, it will base it off input_file_name.
-    """
-    file_save_string = ""
-
-    if output_dir:
-        output_dir = verify_path(output_dir)
-        file_save_string = output_dir
-
-    if file_name:
-        file_save_string += file_name
-    else:
-        if not input_file_name:
-            raise ValueError("save_xls: input_file_name is required when file_name is not provided")
-        file_save_string += input_file_name[:-5] + "_new.xlsx"
-
-    print("Saving the file to: " + file_save_string)
-    wb_obj.save(file_save_string)
-
-def save_xls(wb_obj, input_file_name, file_name=None, output_dir=None):
+def save_xls(wb_obj, input_file_name, file_name=None, output_dir=None, verbosity_level=0):
     """
     Saves the WorkBook to provided Directory and File Name.
     If no File Name and/or Directory provided it will save based on input_file_name.
@@ -219,13 +205,13 @@ def save_xls(wb_obj, input_file_name, file_name=None, output_dir=None):
     else:
         file_save_string += input_file_name[:-5] + "_new.xlsx"
 
-    current_time = get_current_time("t")
-    print(current_time, " - Saving the file to: " + file_save_string)
-    
+    #current_time = get_current_time("t")
+    #print(current_time, " - Saving the file to: " + file_save_string)
+    t0 = perf_counter()
     wb_obj.save(file_save_string)
-    
-    current_time = get_current_time("t")
-    print(current_time, " - Saving the file to: " + file_save_string)
+    delta_timer = perf_counter() - t0
+    if verbosity_level >= 2:
+        print(f"{delta_timer:.3f}s to save file: {file_save_string}")
 
 def mod_dir_based_on_os(dir_name):
     """

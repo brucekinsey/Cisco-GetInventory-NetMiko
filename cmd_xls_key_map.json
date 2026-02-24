@@ -338,6 +338,66 @@
       }
     }
   },
+  "fortinet": {
+    "gather_arp": {
+      "ARP": {
+        "ip_address": "IP Address",
+        "age": "Age",
+        "mac_address": "Hardware/MAC",
+        "interface": "Interface"
+      }
+    },
+    "gather_lldp": {
+      "LLDP": {
+        "port_txt": "Local Port",
+        "system_name_data": "Remote Host",
+        "port_id_data": "Remote Port",
+        "port_desc_data": "Remote Description",
+        "address_1_addr": "MGMT IP",
+        "chassis_data": "Chassis ID",
+        "system_desc_data": "Software",
+        "system_caps_enabled_txt": "Capabilities",
+        "vlan_id": "VLAN ID"
+      }
+    },
+    "gather_route": {
+      "Routes": {
+        "type": "Protocol",
+        "destination": "Route",
+        "distance": "Distance",
+        "metric": "Metric",
+        "gateway": "Next Hop IP",
+        "interface": "Next Hop IF",
+        "last_time_update": "Uptime"
+      }
+    },
+    "gather_interface": {
+      "Interfaces": {
+        "name": "Interface",
+        "status": "Link",
+        "ip_address": "IP Add",
+        "mode": "Type",
+        "type": "Type",
+        "short_if": "Short IF"        
+      }
+    },
+    "gather_bgp": {
+      "BGP": {
+        "bgp_neigh": "Neighbor",
+        "neigh_as": "Remote AS",
+        "up_down": "Up/Down",
+        "state_pfxrcd": "State/PfxRcd"
+      }
+    },
+    "gather_inventory":{
+      "Inventory":{
+        "pid":"Part ID",
+        "name":"Device",
+        "descr":"Description",
+        "sn":"Serial Number"
+      }
+    }
+  },
   "device_info_map":{
     "active":2,
     "parse_method":3,
