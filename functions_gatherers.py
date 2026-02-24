@@ -395,8 +395,13 @@ def gather_lldp(connection, net_dev, count):
     if net_dev.parse_method in ["fortinet"]:
         command = "diagnose lldprx port neighbor details"
         txt_tmpl = (r"ntc-templates\test_tmpl\fortinet_diagnose_lldprx_port_neighbor_details_port-name.textfsm")
-
-    output = log_cmd_textfsm(connection, net_dev, command, count, txt_tmpl)
+    try:
+        output = log_cmd_textfsm(connection, net_dev, command, count, txt_tmpl)
+    except Exception as e:
+        # Treat LLDP failures as non-fatal (no traceback spam)
+        net_dev.add_error_msg(f"LLDP gather or parse failed: {e!r}")
+        net_dev.show_for_xls["gather_lldp"] = [{"chassis_id": "No LLDP Data"}]
+        return
     
     if net_dev.parse_method == "fortinet" and isinstance(output, list):
         for row in output:
